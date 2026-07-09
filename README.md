@@ -1,6 +1,7 @@
 # שומר עברית — TypeBeep
 
 לינק להורדה: https://github.com/devsite350-br/type-beep/raw/main/TypeBeep-Setup.exe
+
 תוכנת Windows קטנה שרצה ליד השעון ומתריעה בצליל עדין (או הבהוב מסך) כאשר:
 - **CapsLock דלוק**
 - **המקלדת לא בעברית**
