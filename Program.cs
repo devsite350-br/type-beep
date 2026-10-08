@@ -27,6 +27,7 @@ namespace TypeBeep
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr LoadKeyboardLayout(string pwszKLID, uint flags);
         [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+        [DllImport("user32.dll")] public static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[] lpList);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int X, Y; }
@@ -43,6 +44,7 @@ namespace TypeBeep
             [FieldOffset(24)] public IntPtr dwExtraInfo;
         }
         public const uint INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 0x2, KEYEVENTF_UNICODE = 0x4;
+        public static readonly IntPtr OWN_INPUT_MARK = (IntPtr)0x54424550; // מסמן הקשות שאנחנו שולחים, כדי שה-hook יתעלם מהן
 
         // waveOut — זרם שמע רציף עצמאי (להשארת התקן השמע ער, בנפרד מהצלילים)
         [StructLayout(LayoutKind.Sequential)]
@@ -86,6 +88,66 @@ namespace TypeBeep
         public const uint MOD_CONTROL = 0x2;
         public const uint MOD_SHIFT = 0x4;
         public const int HEBREW_LANGID = 0x040D;
+        public const int LANG_HEBREW = 0x0D, LANG_ENGLISH = 0x09; // שפה ראשית (10 הביטים הנמוכים של LANGID)
+    }
+
+    // בודק האיות של Windows (ISpellChecker) — מילון עברית ואנגלית מובנה במערכת, בלי קבצים חיצוניים.
+    // שימו לב: אסור לקרוא לו מתוך ה-hook של המקלדת (RPC_E_CANTCALLOUT_ININPUTSYNCCALL) — רק אחרי שה-hook חזר
+    [ComImport, Guid("8E018A9D-2415-4677-BF08-794EA61F94BB"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISpellCheckerFactory
+    {
+        [PreserveSig] int get_SupportedLanguages(out IntPtr value);
+        [PreserveSig] int IsSupported([MarshalAs(UnmanagedType.LPWStr)] string languageTag, out int value);
+        [PreserveSig] int CreateSpellChecker([MarshalAs(UnmanagedType.LPWStr)] string languageTag, out ISpellChecker value);
+    }
+    [ComImport, Guid("B6FD0B71-E2BC-4653-8D05-F197E412770B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISpellChecker
+    {
+        [PreserveSig] int get_LanguageTag(out IntPtr value);
+        [PreserveSig] int Check([MarshalAs(UnmanagedType.LPWStr)] string text, out IEnumSpellingError value);
+    }
+    [ComImport, Guid("803E3BD4-2828-4410-8290-418D1D73C762"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IEnumSpellingError { [PreserveSig] int Next(out IntPtr value); }
+    [ComImport, Guid("7AB36653-1796-484B-BDFA-E74F1DB7C1DC")] class SpellCheckerFactoryCom { }
+
+    static class Speller
+    {
+        static ISpellChecker he, en;
+        static bool inited;
+
+        public static bool Available { get { Init(); return he != null && en != null; } }
+
+        static void Init()
+        {
+            if (inited) return;
+            inited = true;
+            try
+            {
+                var f = (ISpellCheckerFactory)new SpellCheckerFactoryCom();
+                int ok;
+                if (f.IsSupported("he-IL", out ok) == 0 && ok != 0) f.CreateSpellChecker("he-IL", out he);
+                if (f.IsSupported("en-US", out ok) == 0 && ok != 0) f.CreateSpellChecker("en-US", out en);
+            }
+            catch { he = null; en = null; }
+        }
+
+        public static bool IsWord(string word, bool hebrew)
+        {
+            Init();
+            ISpellChecker sc = hebrew ? he : en;
+            if (sc == null || word.Length == 0) return false;
+            try
+            {
+                IEnumSpellingError errs;
+                if (sc.Check(word, out errs) != 0 || errs == null) return false;
+                IntPtr err;
+                bool hasError = errs.Next(out err) == 0; // S_FALSE = אין שגיאות
+                if (err != IntPtr.Zero) Marshal.Release(err);
+                Marshal.ReleaseComObject(errs);
+                return !hasError;
+            }
+            catch { return false; }
+        }
     }
 
     class Settings
@@ -95,12 +157,14 @@ namespace TypeBeep
         public bool RunAtStartup = true;
         public bool CapsReminder = true;
         public bool KeepAwake = true;   // זרם שקט שמונע מהתקן השמע "להירדם" ולבלוע צלילים קצרים
+        public bool AutoFix = true;     // תיקון אוטומטי של מילה שיצאה ג'יבריש (עברית <-> אנגלית)
         public int AlertMode = 0;      // 0 = צליל, 1 = צליל+הבהוב, 2 = הבהוב בלבד
         public int HotkeyIdx = 0;      // אינדקס קיצור ההמרה לעברית
         public int Volume = 60;        // 0-100
         public int CapsSound = 0;
         public int LangSound = 2;
         public List<string> Excluded = new List<string>();
+        public List<string> IgnoredWords = new List<string>(); // מילים שהמשתמש ביטל את התיקון האוטומטי שלהן
 
         static string FilePath
         {
@@ -122,12 +186,14 @@ namespace TypeBeep
                 sb.AppendLine("startup=" + (RunAtStartup ? 1 : 0));
                 sb.AppendLine("reminder=" + (CapsReminder ? 1 : 0));
                 sb.AppendLine("keepAwake=" + (KeepAwake ? 1 : 0));
+                sb.AppendLine("autoFix=" + (AutoFix ? 1 : 0));
                 sb.AppendLine("mode=" + AlertMode);
                 sb.AppendLine("hotkey=" + HotkeyIdx);
                 sb.AppendLine("volume=" + Volume);
                 sb.AppendLine("capsSound=" + CapsSound);
                 sb.AppendLine("langSound=" + LangSound);
                 sb.AppendLine("excluded=" + string.Join("|", Excluded.ToArray()));
+                sb.AppendLine("ignoredWords=" + string.Join("|", IgnoredWords.ToArray()));
                 File.WriteAllText(FilePath, sb.ToString(), Encoding.UTF8);
             }
             catch { }
@@ -151,6 +217,7 @@ namespace TypeBeep
                         case "startup": s.RunAtStartup = val == "1"; break;
                         case "reminder": s.CapsReminder = val == "1"; break;
                         case "keepAwake": s.KeepAwake = val == "1"; break;
+                        case "autoFix": s.AutoFix = val == "1"; break;
                         case "mode": int.TryParse(val, out s.AlertMode); break;
                         case "hotkey": int.TryParse(val, out s.HotkeyIdx); break;
                         case "volume": int.TryParse(val, out s.Volume); break;
@@ -159,6 +226,10 @@ namespace TypeBeep
                         case "excluded":
                             if (val.Length > 0)
                                 s.Excluded = new List<string>(val.Split('|'));
+                            break;
+                        case "ignoredWords":
+                            if (val.Length > 0)
+                                s.IgnoredWords = new List<string>(val.Split('|'));
                             break;
                     }
                 }
@@ -330,6 +401,29 @@ namespace TypeBeep
         IntPtr mouseHookId = IntPtr.Zero;
         Native.LowLevelKeyboardProc mouseProc;
         uint hotkeyMods; int hotkeyVk;  // הקיצור הפעיל — כדי שלחיצתו לא תאפס את המעקב
+
+        // המילה הנוכחית כרצף מקשים פיזיים — כדי לקרוא אותה גם בעברית וגם באנגלית
+        readonly List<int> wordKeys = new List<int>();
+        bool wordUnusable;              // ספרה / Shift / מחיקה אל מחוץ למילה — לא מתקנים אוטומטית
+        AutoFixUndo pendingUndo;        // Backspace מיד אחרי תיקון אוטומטי מבטל אותו
+        // מילים שלא מתקנים: קיצורים טכניים נפוצים שבעברית יוצאים מילה (api = "שפן") + מה שהמשתמש ביטל
+        readonly HashSet<string> ignoredWords = new HashSet<string>(new[] {
+            "api", "url", "urls", "html", "css", "js", "ts", "sql", "ui", "ux", "www", "http", "https",
+            "pdf", "png", "jpg", "jpeg", "gif", "svg", "usb", "wifi", "dns", "ip", "id", "ids", "seo", "crm",
+            "json", "xml", "csv", "npm", "git", "src", "img", "div", "btn", "app", "apps", "ai", "gpt" });
+        IntPtr autoEnglishHwnd;         // חלון שהעברנו בעצמנו לאנגלית — לא מתריעים בו על "לא עברית"
+
+        // מילים שהושלמו ברצף ההקלדה הנוכחי — כדי לתקן גם מילים דו-משמעיות שלפני מילת ג'יבריש ("do tbh" -> "גם אני")
+        readonly List<TypedWord> prevWords = new List<TypedWord>();
+        bool justFixed;                 // הרווח הנוכחי סגר מילה שתוקנה — לא נשמרת כמילה קודמת
+        bool spaceHeld;                 // רווח שנבלע ב-hook וממתין להחלטה
+
+        class TypedWord { public List<int> Keys; public bool Hebrew; }
+
+        class AutoFixUndo
+        {
+            public IntPtr Hwnd; public string Original, Fixed; public bool ToHebrew; public List<int> Keys;
+        }
         DateTime pausedUntil = DateTime.MinValue;
         bool prevBadCaps, prevBadLang, armedCaps, armedLang, capsAlerted, langAlerted;
         DateTime lastCapsAlert = DateTime.MinValue;
@@ -338,7 +432,7 @@ namespace TypeBeep
         // פקדים
         Label lblStatus, lblVolPct, lblHotkeyHint;
         ComboBox cmbHotkey;
-        CheckBox chkCaps, chkLang, chkReminder, chkStartup, chkKeepAwake;
+        CheckBox chkCaps, chkLang, chkReminder, chkStartup, chkKeepAwake, chkAutoFix;
         ComboBox cmbCapsSound, cmbLangSound;
         TrackBar trkVolume;
         RadioButton rbSound, rbBoth, rbFlash;
@@ -349,8 +443,9 @@ namespace TypeBeep
         {
             this.startHidden = startHidden;
             settings = Settings.Load();
+            foreach (string w in settings.IgnoredWords) ignoredWords.Add(w);
             ownPid = (uint)Process.GetCurrentProcess().Id;
-            Log("=== app start v1.6 pid=" + ownPid + " exe=" + Application.ExecutablePath);
+            Log("=== app start v1.7 pid=" + ownPid + " exe=" + Application.ExecutablePath);
             try { if (Directory.Exists(SoundsDir)) Directory.Delete(SoundsDir, true); }
             catch (Exception ex) { Log("sounds cleanup failed: " + ex.Message); }
 
@@ -359,7 +454,7 @@ namespace TypeBeep
             RightToLeftLayout = true;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
-            ClientSize = new Size(474, 616);
+            ClientSize = new Size(474, 642);
             Font = new Font("Segoe UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
 
@@ -381,6 +476,7 @@ namespace TypeBeep
             // יצירת ידית חלון + רישום קיצור גלובלי גם כשמתחילים מוסתרים
             IntPtr h = this.Handle;
             RegisterConvertHotkey(true);
+            Log("speller he+en available=" + Speller.Available);
         }
 
         protected override void SetVisibleCore(bool value)
@@ -414,27 +510,28 @@ namespace TypeBeep
             g2.Controls.AddRange(new Control[] { rbSound, rbBoth, rbFlash });
             Controls.Add(g2);
 
-            var g3 = new GroupBox { Text = "אפשרויות", Location = new Point(12, 236), Size = new Size(450, 136) };
-            chkReminder = new CheckBox { Text = "תזכורת חוזרת כל 30 שניות כש-CapsLock נשאר דלוק", Location = new Point(12, 22), Size = new Size(425, 22) };
-            chkStartup = new CheckBox { Text = "הפעל את התוכנה בעליית המחשב", Location = new Point(12, 48), Size = new Size(425, 22) };
-            chkKeepAwake = new CheckBox { Text = "השאר את התקן השמע ער — פתרון לצלילים ש\"נבלעים\" (מומלץ)", Location = new Point(12, 74), Size = new Size(425, 22) };
-            var lblHk = new Label { Text = "קיצור ההמרה לעברית:", Location = new Point(12, 104), Size = new Size(125, 20) };
-            cmbHotkey = new ComboBox { Location = new Point(145, 101), Size = new Size(125, 24), DropDownStyle = ComboBoxStyle.DropDownList };
+            var g3 = new GroupBox { Text = "אפשרויות", Location = new Point(12, 236), Size = new Size(450, 162) };
+            chkAutoFix = new CheckBox { Text = "תיקון אוטומטי של ג'יבריש בעברית/אנגלית (Backspace מיד אחריו מבטל)", Location = new Point(12, 22), Size = new Size(425, 22) };
+            chkReminder = new CheckBox { Text = "תזכורת חוזרת כל 30 שניות כש-CapsLock נשאר דלוק", Location = new Point(12, 48), Size = new Size(425, 22) };
+            chkStartup = new CheckBox { Text = "הפעל את התוכנה בעליית המחשב", Location = new Point(12, 74), Size = new Size(425, 22) };
+            chkKeepAwake = new CheckBox { Text = "השאר את התקן השמע ער — פתרון לצלילים ש\"נבלעים\" (מומלץ)", Location = new Point(12, 100), Size = new Size(425, 22) };
+            var lblHk = new Label { Text = "קיצור ההמרה לעברית:", Location = new Point(12, 130), Size = new Size(125, 20) };
+            cmbHotkey = new ComboBox { Location = new Point(145, 127), Size = new Size(125, 24), DropDownStyle = ComboBoxStyle.DropDownList };
             cmbHotkey.Items.AddRange(HotkeyNames);
-            g3.Controls.AddRange(new Control[] { chkReminder, chkStartup, chkKeepAwake, lblHk, cmbHotkey });
+            g3.Controls.AddRange(new Control[] { chkAutoFix, chkReminder, chkStartup, chkKeepAwake, lblHk, cmbHotkey });
             Controls.Add(g3);
 
-            var g4 = new GroupBox { Text = "תוכנות מוחרגות — לא תישמע בהן התראה", Location = new Point(12, 380), Size = new Size(450, 138) };
+            var g4 = new GroupBox { Text = "תוכנות מוחרגות — בלי התראות ובלי תיקון אוטומטי", Location = new Point(12, 406), Size = new Size(450, 138) };
             lstExcluded = new ListBox { Location = new Point(12, 24), Size = new Size(290, 100) };
             var btnAddExc = new Button { Text = "הוספת תוכנה...", Location = new Point(312, 24), Size = new Size(126, 30) };
             var btnDelExc = new Button { Text = "הסרה", Location = new Point(312, 62), Size = new Size(126, 30) };
             g4.Controls.AddRange(new Control[] { lstExcluded, btnAddExc, btnDelExc });
             Controls.Add(g4);
 
-            btnPause = new Button { Text = "השהה לשעה", Location = new Point(12, 528), Size = new Size(150, 32) };
-            lblHotkeyHint = new Label { Location = new Point(175, 526), Size = new Size(290, 36), ForeColor = Color.DimGray };
-            var btnHide = new Button { Text = "הסתר לאזור השעון", Location = new Point(12, 570), Size = new Size(150, 30) };
-            var lblTray = new Label { Text = "סגירת החלון רק מסתירה אותו. ליציאה מלאה: קליק ימני על האייקון שליד השעון", Location = new Point(175, 568), Size = new Size(290, 40), ForeColor = Color.DimGray };
+            btnPause = new Button { Text = "השהה לשעה", Location = new Point(12, 554), Size = new Size(150, 32) };
+            lblHotkeyHint = new Label { Location = new Point(175, 552), Size = new Size(290, 36), ForeColor = Color.DimGray };
+            var btnHide = new Button { Text = "הסתר לאזור השעון", Location = new Point(12, 596), Size = new Size(150, 30) };
+            var lblTray = new Label { Text = "סגירת החלון רק מסתירה אותו. ליציאה מלאה: קליק ימני על האייקון שליד השעון", Location = new Point(175, 594), Size = new Size(290, 40), ForeColor = Color.DimGray };
             Controls.AddRange(new Control[] { btnPause, lblHotkeyHint, btnHide, lblTray });
 
             cmbCapsSound.Items.AddRange(Sounds.Names);
@@ -446,6 +543,7 @@ namespace TypeBeep
             chkLang.CheckedChanged += save;
             chkReminder.CheckedChanged += save;
             chkKeepAwake.CheckedChanged += save;
+            chkAutoFix.CheckedChanged += save;
             cmbHotkey.SelectedIndexChanged += delegate
             {
                 if (loadingUi) return;
@@ -487,6 +585,7 @@ namespace TypeBeep
             chkLang.Checked = settings.LangAlert;
             chkReminder.Checked = settings.CapsReminder;
             chkKeepAwake.Checked = settings.KeepAwake;
+            chkAutoFix.Checked = settings.AutoFix;
             chkStartup.Checked = settings.RunAtStartup;
             cmbCapsSound.SelectedIndex = settings.CapsSound;
             cmbLangSound.SelectedIndex = settings.LangSound;
@@ -513,6 +612,7 @@ namespace TypeBeep
             settings.LangAlert = chkLang.Checked;
             settings.CapsReminder = chkReminder.Checked;
             settings.KeepAwake = chkKeepAwake.Checked;
+            settings.AutoFix = chkAutoFix.Checked;
             settings.RunAtStartup = chkStartup.Checked;
             settings.CapsSound = Math.Max(0, cmbCapsSound.SelectedIndex);
             settings.LangSound = Math.Max(0, cmbLangSound.SelectedIndex);
@@ -640,7 +740,8 @@ namespace TypeBeep
 
         IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && !suppressTyping)
+            // הקשות שאנחנו עצמנו שולחים (המרה/תיקון) לא נספרות כהקלדה
+            if (nCode >= 0 && !suppressTyping && Marshal.ReadIntPtr(lParam, 16) != Native.OWN_INPUT_MARK)
             {
                 int vk = Marshal.ReadInt32(lParam);
                 if (wParam == (IntPtr)Native.WM_KEYDOWN)
@@ -650,20 +751,61 @@ namespace TypeBeep
                         if (armedCaps && prevBadCaps && !capsAlerted) DoAlert(true);
                         if (armedLang && prevBadLang && !langAlerted) DoAlert(false);
                     }
+                    if (pendingUndo != null && !IsModifierVk(vk))
+                    {
+                        AutoFixUndo undo = pendingUndo;
+                        pendingUndo = null;
+                        if (vk == 0x08 && !AnyModifierDown() && Native.GetForegroundWindow() == undo.Hwnd)
+                        {
+                            BeginInvoke(new MethodInvoker(delegate { UndoAutoFix(undo); }));
+                            return (IntPtr)1; // בולעים את ה-Backspace — הביטול מחליף אותו
+                        }
+                    }
+                    if (vk == 0x20 && !spaceHeld && AutoFixLayout() >= 0)
+                    {
+                        // בודק האיות (COM) חסום בתוך hook — מחזיקים את הרווח ומחליטים מיד אחרי שה-hook חוזר
+                        spaceHeld = true;
+                        BeginInvoke(new MethodInvoker(ResolveHeldSpace));
+                        return (IntPtr)1;
+                    }
                     TrackKey(vk);
                 }
                 else if (wParam == (IntPtr)Native.WM_SYSKEYDOWN)
                 {
                     // צירופי Alt מבצעים פעולות — מאפסים את המעקב (חוץ מלחיצת קיצור ההמרה עצמו)
-                    if (!IsModifierVk(vk) && !IsHotkeyPress(vk)) typedBuf.Length = 0;
+                    if (!IsModifierVk(vk) && !IsHotkeyPress(vk)) { ClearTyped(); pendingUndo = null; }
                 }
             }
             return Native.CallNextHookEx(hookId, nCode, wParam, lParam);
         }
 
+        static bool AnyModifierDown()
+        {
+            return (Native.GetAsyncKeyState(0x11) & 0x8000) != 0 ||
+                   (Native.GetAsyncKeyState(0x12) & 0x8000) != 0 ||
+                   (Native.GetAsyncKeyState(0x10) & 0x8000) != 0 ||
+                   (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 ||
+                   (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+        }
+
+        void ClearTyped()
+        {
+            typedBuf.Length = 0;
+            wordKeys.Clear();
+            wordUnusable = false;
+            prevWords.Clear();
+        }
+
+        bool ForegroundLayoutIs(int primaryLang)
+        {
+            uint pid;
+            uint tid = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
+            return ((long)Native.GetKeyboardLayout(tid) & 0x3FF) == primaryLang;
+        }
+
         IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && typedBuf.Length > 0)
+            if (nCode >= 0 && (typedBuf.Length > 0 || pendingUndo != null))
             {
                 int msg = wParam.ToInt32();
                 if (msg == 0x201 || msg == 0x204 || msg == 0x207) // לחיצת עכבר כלשהי
@@ -672,7 +814,10 @@ namespace TypeBeep
                     var pt = new Native.POINT { X = Marshal.ReadInt32(lParam), Y = Marshal.ReadInt32(lParam, 4) };
                     IntPtr clicked = Native.GetAncestor(Native.WindowFromPoint(pt), Native.GA_ROOT);
                     if (clicked != IntPtr.Zero && clicked == Native.GetAncestor(typedHwnd, Native.GA_ROOT))
-                        typedBuf.Length = 0;
+                    {
+                        ClearTyped();
+                        pendingUndo = null;
+                    }
                 }
             }
             return Native.CallNextHookEx(mouseHookId, nCode, wParam, lParam);
@@ -684,15 +829,21 @@ namespace TypeBeep
             if (IsHotkeyPress(vk)) return; // לחיצת קיצור ההמרה לא נוגעת במעקב
 
             IntPtr fg = Native.GetForegroundWindow();
-            if (fg != typedHwnd) { typedBuf.Length = 0; typedHwnd = fg; }
+            if (fg != typedHwnd) { ClearTyped(); typedHwnd = fg; }
 
             bool ctrl = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
-            if (ctrl) { typedBuf.Length = 0; return; } // קיצורי Ctrl משנים מצב — מאפסים
+            if (ctrl) { ClearTyped(); return; } // קיצורי Ctrl משנים מצב — מאפסים
 
-            if (vk == 0x08) { if (typedBuf.Length > 0) typedBuf.Length--; return; } // Backspace
+            if (vk == 0x08) // Backspace
+            {
+                if (typedBuf.Length > 0) typedBuf.Length--;
+                if (wordKeys.Count > 0) wordKeys.RemoveAt(wordKeys.Count - 1);
+                else { wordUnusable = true; prevWords.Clear(); } // מחיקה אל תוך המילה הקודמת — כבר לא יודעים מה המילה המלאה
+                return;
+            }
             if (vk == 0x0D || vk == 0x09 || vk == 0x1B || vk == 0x2E ||
                 (vk >= 0x21 && vk <= 0x28) || (vk >= 0x70 && vk <= 0x87))          // Enter/Tab/Esc/Del/ניווט/F1-F24
-            { typedBuf.Length = 0; return; }
+            { ClearTyped(); return; }
 
             bool shift = (Native.GetAsyncKeyState(0x10) & 0x8000) != 0;
             char c = MapVkToHebrewChar(vk, shift);
@@ -701,6 +852,191 @@ namespace TypeBeep
                 typedBuf.Append(c);
                 if (typedBuf.Length > 200) typedBuf.Remove(0, typedBuf.Length - 200);
             }
+
+            if (vk == 0x20) // רווח — מילה חדשה
+            {
+                if (justFixed || wordUnusable || wordKeys.Count == 0) prevWords.Clear();
+                else
+                {
+                    prevWords.Add(new TypedWord { Keys = new List<int>(wordKeys), Hebrew = ForegroundLayoutIs(Native.LANG_HEBREW) });
+                    if (prevWords.Count > 8) prevWords.RemoveAt(0);
+                }
+                justFixed = false;
+                wordKeys.Clear();
+                wordUnusable = false;
+                return;
+            }
+            if (c == '\0' || (vk >= 0x30 && vk <= 0x39) || (vk >= 0x60 && vk <= 0x6F) ||
+                (shift && vk >= 0x41 && vk <= 0x5A))
+                wordUnusable = true; // ספרות, מקלדת נומרית, או אות גדולה — כנראה מכוון, לא נוגעים
+            else
+                wordKeys.Add(vk | (shift ? 0x10000 : 0));
+        }
+
+        // ---- זיהוי ג'יבריש ותיקון אוטומטי ----
+        // בסוף כל מילה (רווח) קוראים את אותן הקשות גם בפריסה השנייה. אם בפריסה הנוכחית יצא ג'יבריש
+        // ובשנייה יצאה מילה אמיתית (לפי בודק האיות של Windows) — מחליפים את המילה ומעבירים את המקלדת.
+
+        // בדיקות זולות (בלי בודק האיות) שמותר להריץ בתוך ה-hook. מחזיר 1 = פריסה עברית, 0 = אנגלית, -1 = לא מתקנים
+        int AutoFixLayout()
+        {
+            if (!settings.AutoFix || DateTime.Now < pausedUntil) return -1;
+            if (wordUnusable || wordKeys.Count < 2) return -1;
+            if (AnyModifierDown() || (Native.GetKeyState(Native.VK_CAPITAL) & 1) == 1) return -1;
+
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg == IntPtr.Zero || fg != typedHwnd) return -1;
+            uint pid;
+            uint tid = Native.GetWindowThreadProcessId(fg, out pid);
+            if (pid == ownPid || settings.Excluded.Contains(GetProcName(pid))) return -1;
+
+            int lang = (int)((long)Native.GetKeyboardLayout(tid) & 0x3FF);
+            return lang == Native.LANG_HEBREW ? 1 : lang == Native.LANG_ENGLISH ? 0 : -1;
+        }
+
+        // רץ מיד אחרי ה-hook: מתקן את המילה או משחרר את הרווח שהוחזק כרגיל
+        void ResolveHeldSpace()
+        {
+            spaceHeld = false;
+            try
+            {
+                if (TryAutoFix()) return;
+            }
+            catch (Exception ex) { Log("autofix FAILED: " + ex.Message); }
+            TrackKey(0x20);
+            SendKey(0x20);
+        }
+
+        bool TryAutoFix()
+        {
+            int layout = AutoFixLayout();
+            if (layout < 0) return false;
+            bool curHebrew = layout == 1;
+            IntPtr fg = typedHwnd;
+
+            string cur = ReadKeys(wordKeys, curHebrew), alt = ReadKeys(wordKeys, !curHebrew);
+            if (cur == null || alt == null || ignoredWords.Contains(cur.ToLowerInvariant())) return false;
+
+            string curCore = LetterCore(cur), altCore = LetterCore(alt);
+            if (altCore.Length < 2 || altCore.Length < alt.Length - 1) return false;
+            if (!IsRealWord(altCore, !curHebrew)) return false;
+            // אם גם הקריאה הנוכחית היא מילה — משאירים, אלא אם היא "מילה" רק כי תווים שבשנייה הם אותיות נחתכו
+            // (למשל "שבת" בפריסה אנגלית יוצא "ac," — "ac" עלול להיחשב מילה)
+            if (curCore.Length > 0 && IsRealWord(curCore, curHebrew) && altCore.Length <= curCore.Length) return false;
+
+            // מילים קודמות באותו רצף שנכתבו באותה פריסה ותקינות גם בשפה השנייה (כמו "do" = "גם") — מתקנים גם אותן
+            var origSb = new StringBuilder(cur);
+            var fixSb = new StringBuilder(alt);
+            for (int i = prevWords.Count - 1; i >= 0; i--)
+            {
+                TypedWord w = prevWords[i];
+                if (w.Hebrew != curHebrew) break;
+                string pc = ReadKeys(w.Keys, curHebrew), pa = ReadKeys(w.Keys, !curHebrew);
+                if (pc == null || pa == null || ignoredWords.Contains(pc.ToLowerInvariant())) break;
+                string paCore = LetterCore(pa);
+                if (paCore.Length < 2 || !IsRealWord(paCore, !curHebrew)) break;
+                origSb.Insert(0, pc + " ");
+                fixSb.Insert(0, pa + " ");
+            }
+
+            IntPtr hwnd = fg;
+            var keys = new List<int>(wordKeys);
+            bool toHebrew = !curHebrew;
+            string original = origSb.ToString(), fixedText = fixSb.ToString();
+            justFixed = true;
+            TrackKey(0x20); // סוגר את המילה במעקב (הרווח עצמו נשלח עם המילה המתוקנת)
+            ApplyAutoFix(hwnd, original, fixedText, toHebrew, keys);
+            return true;
+        }
+
+        // מילה לפי בודק האיות. באנגלית דורשים גם תנועה — אחרת קיצורים כמו "kt" (= "לא") נחשבים מילה
+        static bool IsRealWord(string word, bool hebrew)
+        {
+            if (!hebrew && word.ToLowerInvariant().IndexOfAny("aeiouy".ToCharArray()) < 0) return false;
+            return Speller.IsWord(word, hebrew);
+        }
+
+        void ApplyAutoFix(IntPtr hwnd, string original, string fixedWord, bool toHebrew, List<int> keys)
+        {
+            try
+            {
+                SendBackspaces(original.Length);
+                SendUnicode(fixedWord + " ");
+                SwitchWindowLayout(hwnd, toHebrew);
+                autoEnglishHwnd = toHebrew ? IntPtr.Zero : hwnd;
+                pendingUndo = new AutoFixUndo { Hwnd = hwnd, Original = original, Fixed = fixedWord, ToHebrew = toHebrew, Keys = keys };
+                Log("autofix: " + original.Length + " chars -> " + (toHebrew ? "he" : "en"));
+            }
+            catch (Exception ex) { Log("autofix FAILED: " + ex.Message); }
+        }
+
+        void UndoAutoFix(AutoFixUndo u)
+        {
+            try
+            {
+                if (Native.GetForegroundWindow() != u.Hwnd) return;
+                SendBackspaces(u.Fixed.Length + 1);
+                SendUnicode(u.Original);
+                SwitchWindowLayout(u.Hwnd, !u.ToHebrew);
+                if (u.ToHebrew) autoEnglishHwnd = IntPtr.Zero;
+                string word = u.Original.Substring(u.Original.LastIndexOf(' ') + 1).ToLowerInvariant();
+                if (ignoredWords.Add(word) && word.IndexOf('|') < 0) // לא נתקן את המילה הזאת שוב — גם אחרי הפעלה מחדש
+                {
+                    settings.IgnoredWords.Add(word);
+                    settings.Save();
+                }
+                // ממשיכים את המילה כאילו הרווח לא הוקלד
+                if (typedBuf.Length > 0) typedBuf.Length--;
+                wordKeys.Clear();
+                wordKeys.AddRange(u.Keys);
+                wordUnusable = false;
+                Log("autofix undone");
+            }
+            catch (Exception ex) { Log("autofix undo FAILED: " + ex.Message); }
+        }
+
+        static string ReadKeys(List<int> keys, bool hebrew)
+        {
+            var sb = new StringBuilder(keys.Count);
+            foreach (int k in keys)
+            {
+                int vk = k & 0xFFFF;
+                bool shift = (k & 0x10000) != 0;
+                char c = hebrew ? MapVkToHebrewChar(vk, shift) : MapVkToEnglishChar(vk, shift);
+                if (c == '\0') return null;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // מוריד סימני פיסוק מהקצוות (למשל "hello," -> "hello")
+        static string LetterCore(string s)
+        {
+            int a = 0, b = s.Length;
+            while (a < b && !char.IsLetter(s[a])) a++;
+            while (b > a && !char.IsLetter(s[b - 1])) b--;
+            return s.Substring(a, b - a);
+        }
+
+        // ממפה מקש פיזי לתו בפריסה האנגלית (US)
+        static char MapVkToEnglishChar(int vk, bool shift)
+        {
+            if (vk >= 0x41 && vk <= 0x5A) return shift ? (char)vk : char.ToLowerInvariant((char)vk);
+            switch (vk)
+            {
+                case 0xBA: return shift ? ':' : ';';
+                case 0xDE: return shift ? '"' : '\'';
+                case 0xBC: return shift ? '<' : ',';
+                case 0xBE: return shift ? '>' : '.';
+                case 0xBF: return shift ? '?' : '/';
+                case 0xC0: return shift ? '~' : '`';
+                case 0xBD: return shift ? '_' : '-';
+                case 0xBB: return shift ? '+' : '=';
+                case 0xDB: return shift ? '{' : '[';
+                case 0xDD: return shift ? '}' : ']';
+                case 0xDC: return shift ? '|' : '\\';
+            }
+            return '\0';
         }
 
         // ממפה מקש פיזי לתו שהיה נוצר בפריסה העברית
@@ -757,8 +1093,9 @@ namespace TypeBeep
                 SendBackspaces(hebrew.Length);
                 System.Threading.Thread.Sleep(80);
                 SendUnicode(hebrew);
-                typedBuf.Length = 0;
-                SwitchWindowToHebrew(target);
+                ClearTyped();
+                pendingUndo = null;
+                SwitchWindowLayout(target, true);
                 Log("convert typed: " + hebrew.Length + " chars");
             }
             catch (Exception ex) { Log("convert typed FAILED: " + ex.Message); }
@@ -783,8 +1120,19 @@ namespace TypeBeep
             {
                 inputs[i * 2].type = Native.INPUT_KEYBOARD; inputs[i * 2].wVk = 0x08;
                 inputs[i * 2 + 1].type = Native.INPUT_KEYBOARD; inputs[i * 2 + 1].wVk = 0x08; inputs[i * 2 + 1].dwFlags = Native.KEYEVENTF_KEYUP;
+                inputs[i * 2].dwExtraInfo = inputs[i * 2 + 1].dwExtraInfo = Native.OWN_INPUT_MARK;
             }
             if (n > 0) Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
+        }
+
+        static void SendKey(ushort vk)
+        {
+            var inputs = new Native.INPUT[2];
+            inputs[0].type = inputs[1].type = Native.INPUT_KEYBOARD;
+            inputs[0].wVk = inputs[1].wVk = vk;
+            inputs[1].dwFlags = Native.KEYEVENTF_KEYUP;
+            inputs[0].dwExtraInfo = inputs[1].dwExtraInfo = Native.OWN_INPUT_MARK;
+            Native.SendInput(2, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
         }
 
         static void SendUnicode(string s)
@@ -794,15 +1142,23 @@ namespace TypeBeep
             {
                 inputs[i * 2].type = Native.INPUT_KEYBOARD; inputs[i * 2].wScan = s[i]; inputs[i * 2].dwFlags = Native.KEYEVENTF_UNICODE;
                 inputs[i * 2 + 1].type = Native.INPUT_KEYBOARD; inputs[i * 2 + 1].wScan = s[i]; inputs[i * 2 + 1].dwFlags = Native.KEYEVENTF_UNICODE | Native.KEYEVENTF_KEYUP;
+                inputs[i * 2].dwExtraInfo = inputs[i * 2 + 1].dwExtraInfo = Native.OWN_INPUT_MARK;
             }
             if (s.Length > 0) Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
         }
 
-        static void SwitchWindowToHebrew(IntPtr hwnd)
+        static void SwitchWindowLayout(IntPtr hwnd, bool hebrew)
         {
             try
             {
-                IntPtr hkl = Native.LoadKeyboardLayout("0000040D", 0);
+                // מעדיפים פריסה שכבר מותקנת אצל המשתמש (למשל English UK), ורק אם אין — טוענים את ברירת המחדל
+                int want = hebrew ? Native.LANG_HEBREW : Native.LANG_ENGLISH;
+                IntPtr hkl = IntPtr.Zero;
+                var list = new IntPtr[32];
+                int n = Native.GetKeyboardLayoutList(list.Length, list);
+                for (int i = 0; i < n && hkl == IntPtr.Zero; i++)
+                    if (((long)list[i] & 0x3FF) == want) hkl = list[i];
+                if (hkl == IntPtr.Zero) hkl = Native.LoadKeyboardLayout(hebrew ? "0000040D" : "00000409", 0);
                 if (hkl != IntPtr.Zero)
                     Native.PostMessage(hwnd, (uint)Native.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
             }
@@ -830,7 +1186,9 @@ namespace TypeBeep
             if (fg != IntPtr.Zero && pid != ownPid) lastForeignHwnd = fg;
 
             bool badCaps = settings.CapsAlert && caps && !paused && !excluded;
-            bool badLang = settings.LangAlert && !hebrew && !paused && !excluded;
+            // אם התיקון האוטומטי העביר את החלון הזה לאנגלית — המשתמש כותב אנגלית בכוונה, לא מתריעים
+            if (hebrew && fg == autoEnglishHwnd) autoEnglishHwnd = IntPtr.Zero;
+            bool badLang = settings.LangAlert && !hebrew && !paused && !excluded && fg != autoEnglishHwnd;
 
             if (badCaps && !prevBadCaps) armedCaps = true; // ההתראה עצמה תופעל רק כשמתחילים להקליד
             if (!badCaps) { armedCaps = false; capsAlerted = false; }

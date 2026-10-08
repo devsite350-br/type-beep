@@ -14,7 +14,7 @@ namespace TypeBeepSetup
     static class Installer
     {
         public const string AppName = "שומר עברית";
-        public const string Version = "1.0";
+        public const string Version = "1.7";
 
         public static string InstallDir
         {
